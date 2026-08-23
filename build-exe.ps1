@@ -3,9 +3,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$gameRootResolved = (Resolve-Path -LiteralPath $GameRoot).Path
 
 $pluginBuilder = Join-Path $PSScriptRoot 'build.ps1'
-& powershell -NoProfile -ExecutionPolicy Bypass -File $pluginBuilder -GameRoot $GameRoot -SkipInstall
+& powershell -NoProfile -ExecutionPolicy Bypass -File $pluginBuilder -GameRoot $gameRootResolved -SkipInstall
 if ($LASTEXITCODE -ne 0) {
     throw "Plugin compilation failed with exit code $LASTEXITCODE"
 }
@@ -17,10 +18,10 @@ $plugin = Join-Path $PSScriptRoot 'bin\KotamonDevCheat.compiled.dll'
 $releaseDirectory = Join-Path $PSScriptRoot 'release'
 $output = Join-Path $releaseDirectory 'KotamonDevCheat.exe'
 $payload = Join-Path $releaseDirectory '.KotamonDevCheat-BepInExPayload.zip'
-$bepInExArchive = Join-Path $GameRoot 'BepInEx-Unity.IL2CPP-win-x64-6.0.0-be.781+637bc7e.zip'
-$patchedBepInEx = Join-Path $GameRoot 'BepInEx\core\BepInEx.Unity.IL2CPP.dll'
-$unityBaseLibraries = Join-Path $GameRoot 'BepInEx\unity-libs\6000.4.1.zip'
-$interopDirectory = Join-Path $GameRoot 'BepInEx\interop'
+$dotnetDirectory = Join-Path $gameRootResolved 'dotnet'
+$coreDirectory = Join-Path $gameRootResolved 'BepInEx\core'
+$unityLibrariesDirectory = Join-Path $gameRootResolved 'BepInEx\unity-libs'
+$interopDirectory = Join-Path $gameRootResolved 'BepInEx\interop'
 $thirdPartyNotices = Join-Path $PSScriptRoot 'THIRD_PARTY_NOTICES.txt'
 $bepInExLicense = 'C:\Program Files\Git\mingw64\share\licenses\gcc-libs\COPYING.LIB'
 $loadOrderPatch = Join-Path $PSScriptRoot 'patch-bepinex-load-order.ps1'
@@ -33,7 +34,7 @@ if (-not (Test-Path -LiteralPath $compiler)) {
 if (-not (Test-Path -LiteralPath $framework)) {
     throw ".NET Framework 4.7.1 reference assemblies not found: $framework"
 }
-foreach ($required in @($bepInExArchive, $patchedBepInEx, $unityBaseLibraries, $interopDirectory,
+foreach ($required in @($dotnetDirectory, $coreDirectory, $unityLibrariesDirectory, $interopDirectory,
     $thirdPartyNotices, $bepInExLicense, $loadOrderPatch, $interopPatch, $bepInExConfig)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "BepInEx payload source not found: $required"
@@ -63,6 +64,17 @@ function Add-FileToArchive(
     }
 }
 
+function Add-DirectoryToArchive(
+    [System.IO.Compression.ZipArchive]$Archive,
+    [string]$Directory,
+    [string]$EntryRoot
+) {
+    Get-ChildItem -LiteralPath $Directory -Recurse -File | ForEach-Object {
+        $relative = $_.FullName.Substring($Directory.Length).TrimStart('\', '/')
+        Add-FileToArchive $Archive $_.FullName ($EntryRoot.TrimEnd('/') + '/' + $relative.Replace('\', '/'))
+    }
+}
+
 if (Test-Path -LiteralPath $payload) {
     Remove-Item -LiteralPath $payload -Force
 }
@@ -73,34 +85,17 @@ $payloadArchive = [System.IO.Compression.ZipArchive]::new(
     [System.IO.Compression.ZipArchiveMode]::Create,
     $false
 )
-$sourceArchive = [System.IO.Compression.ZipFile]::OpenRead($bepInExArchive)
 try {
-    foreach ($sourceEntry in $sourceArchive.Entries) {
-        if ([string]::IsNullOrEmpty($sourceEntry.Name)) {
-            continue
-        }
-        if ($sourceEntry.FullName -ieq 'BepInEx/core/BepInEx.Unity.IL2CPP.dll') {
-            continue
-        }
-
-        $targetEntry = $payloadArchive.CreateEntry(
-            $sourceEntry.FullName,
-            [System.IO.Compression.CompressionLevel]::Optimal
-        )
-        $targetEntry.LastWriteTime = $sourceEntry.LastWriteTime
-        $input = $sourceEntry.Open()
-        $outputStream = $targetEntry.Open()
-        try {
-            $input.CopyTo($outputStream)
-        }
-        finally {
-            $outputStream.Dispose()
-            $input.Dispose()
+    foreach ($rootFile in @('winhttp.dll', 'doorstop_config.ini', '.doorstop_version', 'changelog.txt')) {
+        $sourceFile = Join-Path $gameRootResolved $rootFile
+        if (Test-Path -LiteralPath $sourceFile) {
+            Add-FileToArchive $payloadArchive $sourceFile $rootFile
         }
     }
 
-    Add-FileToArchive $payloadArchive $patchedBepInEx 'BepInEx/core/BepInEx.Unity.IL2CPP.dll'
-    Add-FileToArchive $payloadArchive $unityBaseLibraries 'BepInEx/unity-libs/6000.4.1.zip'
+    Add-DirectoryToArchive $payloadArchive $dotnetDirectory 'dotnet'
+    Add-DirectoryToArchive $payloadArchive $coreDirectory 'BepInEx/core'
+    Add-DirectoryToArchive $payloadArchive $unityLibrariesDirectory 'BepInEx/unity-libs'
     Add-FileToArchive $payloadArchive $bepInExConfig 'BepInEx/config/BepInEx.cfg'
 
     Get-ChildItem -LiteralPath $interopDirectory -Recurse -File |
@@ -116,7 +111,6 @@ try {
     Add-FileToArchive $payloadArchive $interopPatch 'BepInEx/Kotamon-Source/patch-unity6-interop.ps1'
 }
 finally {
-    $sourceArchive.Dispose()
     $payloadArchive.Dispose()
     $payloadStream.Dispose()
 }
@@ -131,25 +125,44 @@ $references = @(
     'System.Windows.Forms.dll'
 ) | ForEach-Object { Join-Path $framework $_ }
 
-$arguments = @(
-    '/nologo',
-    '/noconfig',
-    '/nostdlib+',
-    '/target:winexe',
-    '/platform:anycpu',
-    '/langversion:latest',
-    '/optimize+',
-    '/deterministic+',
-    "/out:$output",
-    "/resource:$plugin,KotamonDevCheat.EmbeddedPlugin.dll",
-    "/resource:$payload,KotamonDevCheat.BepInExPayload.zip"
-)
-$arguments += $references | ForEach-Object { "/reference:$_" }
-$arguments += $source
+$temporaryBuildDirectory = Join-Path ([IO.Path]::GetTempPath()) ('KotamonLauncher-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $temporaryBuildDirectory -Force | Out-Null
+try {
+    $temporarySource = Join-Path $temporaryBuildDirectory 'Program.cs'
+    $temporaryPlugin = Join-Path $temporaryBuildDirectory 'KotamonDevCheat.compiled.dll'
+    $temporaryPayload = Join-Path $temporaryBuildDirectory 'BepInExPayload.zip'
+    $temporaryOutput = Join-Path $temporaryBuildDirectory 'KotamonDevCheat.exe'
+    Copy-Item -LiteralPath $source -Destination $temporarySource -Force
+    Copy-Item -LiteralPath $plugin -Destination $temporaryPlugin -Force
+    Copy-Item -LiteralPath $payload -Destination $temporaryPayload -Force
 
-& $compiler @arguments
-if ($LASTEXITCODE -ne 0) {
-    throw "Launcher compilation failed with exit code $LASTEXITCODE"
+    $arguments = @(
+        '/nologo',
+        '/noconfig',
+        '/nostdlib+',
+        '/target:winexe',
+        '/platform:anycpu',
+        '/langversion:latest',
+        '/optimize+',
+        '/deterministic+',
+        "/out:$temporaryOutput",
+        "/resource:$temporaryPlugin,KotamonDevCheat.EmbeddedPlugin.dll",
+        "/resource:$temporaryPayload,KotamonDevCheat.BepInExPayload.zip"
+    )
+    $arguments += $references | ForEach-Object { "/reference:$_" }
+    $arguments += $temporarySource
+
+    & $compiler @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Launcher compilation failed with exit code $LASTEXITCODE"
+    }
+
+    Copy-Item -LiteralPath $temporaryOutput -Destination $output -Force
+}
+finally {
+    if (Test-Path -LiteralPath $temporaryBuildDirectory) {
+        Remove-Item -LiteralPath $temporaryBuildDirectory -Recurse -Force
+    }
 }
 
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $output).Hash

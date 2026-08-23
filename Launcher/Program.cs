@@ -12,8 +12,8 @@ using System.Windows.Forms;
 [assembly: AssemblyProduct("Kotamon Dev Cheat")]
 [assembly: AssemblyCompany("Kotamon")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("0.2.5.0")]
-[assembly: AssemblyFileVersion("0.2.5.0")]
+[assembly: AssemblyVersion("0.3.11.0")]
+[assembly: AssemblyFileVersion("0.3.11.0")]
 
 namespace KotamonDevCheat.Launcher
 {
@@ -30,10 +30,10 @@ namespace KotamonDevCheat.Launcher
 
     internal sealed class LauncherForm : Form
     {
-        private const string Version = "0.2.5";
+        private const string Version = "0.3.11";
         private const string EmbeddedPluginName = "KotamonDevCheat.EmbeddedPlugin.dll";
         private const string EmbeddedBepInExName = "KotamonDevCheat.BepInExPayload.zip";
-        private const string GameExecutableName = "TrashLover.exe";
+        private const string GameExecutableName = "Kotamon.exe";
         private const string InstallMarkerName = "KotamonDevCheat.install";
 
         private readonly TextBox _gamePath = new TextBox();

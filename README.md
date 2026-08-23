@@ -1,6 +1,6 @@
 # Kotamon Dev Cheese
 
-![Version](https://img.shields.io/badge/version-0.2.5-18a6b8)
+![Version](https://img.shields.io/badge/version-0.3.11-18a6b8)
 ![Unity](https://img.shields.io/badge/Unity-6000.4.1f1-black)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4)
 ![Runtime](https://img.shields.io/badge/runtime-BepInEx%206%20IL2CPP-8a5cf5)
@@ -13,10 +13,13 @@ An educational reverse-engineering and defensive security project for **KOTAMON*
 
 - **Noclip** with adjustable movement speed.
 - **WorldSpeed** with an adjustable `Time.timeScale` multiplier.
-- **Card ESP** with colored boxes, labels, and thin tracer lines.
-- **Fragment HUD** showing `DirtyPartsCount`, the 5-part target, and the native timer.
-- **Auto Cleanup** that processes cards, a timed fragment, and remaining trash in a safe order.
+- **Card, fragment, and figurine ESP** with classified colors, boxes, labels, and thin tracer lines.
+- **Fragment HUD** showing `DirtyPartsCount`, the current target, and the native spawn timer.
+- **Auto Cleanup** that collects dirty cards, card boxes, and all spawned fragments before removing only the engine-tracked normal junk. Figurines and all other rare objects are preserved.
 - **Money editor** through the game's `ParametersController`.
+- **Always Full Bag** toggle.
+- **Max Card Collection** command, which unlocks every card at `Foil` quality.
+- **All Cassettes** command, which unlocks every tape registered by the in-game tape player.
 - Rebindable hotkeys, draggable UI windows, and proper cursor/camera capture.
 - Self-contained Windows launcher with install, update, launch, backup, and uninstall flows.
 
@@ -46,6 +49,9 @@ Click **ДЕИНСТАЛЛЯЦИЯ** and confirm the operation. If the launcher 
 | `F2` | WorldSpeed |
 | `F3` | ESP |
 | `F4` | Auto Cleanup |
+| `F5` | Always Full Bag |
+| `F6` | Max Card Collection |
+| `F7` | All Cassettes |
 
 Every key can be rebound from the in-game menu.
 
@@ -53,7 +59,7 @@ Every key can be rebound from the in-game menu.
 
 The plugin is loaded internally by BepInEx and uses generated IL2CPP interop assemblies to call the game's normal controllers. No process injector is used.
 
-One useful reverse-engineering finding was that card fragments are not world-space pickup objects. The native game periodically increments `ParameterType.DirtyPartsCount`; therefore the ESP represents fragments as a counter/timer instead of drawing a fake world box.
+Recent KOTAMON builds expose card fragments as world pickups. Auto Cleanup uses the native `JunkZoneController._partPickups` registry and explicit item markers to protect and collect recognised fragments through the normal `PlayerPickupController.Pick(..., true)` route. Its destructive pass is restricted to confirmed `EJunkType.Common` objects using the engine's `ui_empty` data, so unidentified objects are retained for manual collection.
 
 The Unity 6 build also required two compatibility adjustments:
 
@@ -61,6 +67,8 @@ The Unity 6 build also required two compatibility adjustments:
 - rename duplicate compiler-generated `<>O` cache types in generated `UnityEngine.CoreModule.dll`.
 
 The corresponding transformations are documented in the included PowerShell scripts.
+
+The build scripts stage compiler inputs in a temporary path, so the full game directory name—including its commas—works without confusing Roslyn's reference parser.
 
 ## Build from source
 

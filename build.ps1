@@ -15,6 +15,7 @@ $source = Join-Path $PSScriptRoot 'KotamonDevCheat.cs'
 $outputDirectory = Join-Path $PSScriptRoot 'bin'
 $output = Join-Path $outputDirectory 'KotamonDevCheat.compiled.dll'
 $pluginDirectory = Join-Path $gameRootResolved 'BepInEx\plugins\KotamonDevCheat'
+$temporaryBuildDirectory = Join-Path ([IO.Path]::GetTempPath()) ('KotamonDevCheat-' + [Guid]::NewGuid().ToString('N'))
 
 New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 if (-not $SkipInstall) {
@@ -49,23 +50,43 @@ foreach ($reference in $references) {
     }
 }
 
-$arguments = @(
-    '/nologo',
-    '/noconfig',
-    '/nostdlib+',
-    '/target:library',
-    '/langversion:latest',
-    '/optimize+',
-    '/deterministic+',
-    "/out:$output"
-)
+New-Item -ItemType Directory -Path $temporaryBuildDirectory -Force | Out-Null
+try {
+    $temporarySource = Join-Path $temporaryBuildDirectory 'KotamonDevCheat.cs'
+    $temporaryOutput = Join-Path $temporaryBuildDirectory 'KotamonDevCheat.compiled.dll'
+    Copy-Item -LiteralPath $source -Destination $temporarySource -Force
 
-$arguments += $references | ForEach-Object { "/reference:$_" }
-$arguments += $source
+    $temporaryReferences = foreach ($reference in $references) {
+        $temporaryReference = Join-Path $temporaryBuildDirectory ([IO.Path]::GetFileName($reference))
+        Copy-Item -LiteralPath $reference -Destination $temporaryReference -Force
+        $temporaryReference
+    }
 
-& $compiler @arguments
-if ($LASTEXITCODE -ne 0) {
-    throw "Compilation failed with exit code $LASTEXITCODE"
+    $arguments = @(
+        '/nologo',
+        '/noconfig',
+        '/nostdlib+',
+        '/target:library',
+        '/langversion:latest',
+        '/optimize+',
+        '/deterministic+',
+        "/out:$temporaryOutput"
+    )
+
+    $arguments += $temporaryReferences | ForEach-Object { "/reference:$_" }
+    $arguments += $temporarySource
+
+    & $compiler @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Compilation failed with exit code $LASTEXITCODE"
+    }
+
+    Copy-Item -LiteralPath $temporaryOutput -Destination $output -Force
+}
+finally {
+    if (Test-Path -LiteralPath $temporaryBuildDirectory) {
+        Remove-Item -LiteralPath $temporaryBuildDirectory -Recurse -Force
+    }
 }
 
 Write-Output "Built: $output"

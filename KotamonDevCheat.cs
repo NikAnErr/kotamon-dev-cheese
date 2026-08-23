@@ -8,6 +8,8 @@ using Il2CppInterop.Runtime.Attributes;
 using Project.Code.Core.Player.Controllers;
 using Project.Code.Core.Player.Movement;
 using Project.Code.Gameplay.Controllers;
+using Project.Code.Gameplay.Data;
+using Project.Code.Gameplay.Interactions;
 using Project.Code.Gameplay.Interactions.Pickups;
 using Project.Code.Gameplay.Player;
 using Project.Code.Gameplay.Player.Controllers;
@@ -21,7 +23,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "local.kotamon.devcheat";
     public const string PluginName = "Kotamon Dev Cheat";
-    public const string PluginVersion = "0.2.5";
+    public const string PluginVersion = "0.3.11";
 
     internal static ManualLogSource ModLog { get; private set; }
     internal static ConfigFile ModConfig { get; private set; }
@@ -31,6 +33,9 @@ public sealed class Plugin : BasePlugin
     internal static ConfigEntry<KeyCode> WorldSpeedKey { get; private set; }
     internal static ConfigEntry<KeyCode> EspKey { get; private set; }
     internal static ConfigEntry<KeyCode> AutoCleanupKey { get; private set; }
+    internal static ConfigEntry<KeyCode> BagAlwaysFullKey { get; private set; }
+    internal static ConfigEntry<KeyCode> MaxCollectionKey { get; private set; }
+    internal static ConfigEntry<KeyCode> CollectAllTapesKey { get; private set; }
 
     internal static ConfigEntry<float> NoclipSpeed { get; private set; }
     internal static ConfigEntry<float> WorldSpeedValue { get; private set; }
@@ -39,6 +44,7 @@ public sealed class Plugin : BasePlugin
 
     internal static ConfigEntry<bool> WorldSpeedEnabled { get; private set; }
     internal static ConfigEntry<bool> EspEnabled { get; private set; }
+    internal static ConfigEntry<bool> BagAlwaysFullEnabled { get; private set; }
 
     private CheatBehaviour _behaviour;
 
@@ -52,6 +58,9 @@ public sealed class Plugin : BasePlugin
         WorldSpeedKey = Config.Bind("Hotkeys", "WorldSpeed", KeyCode.F2, "Toggle selected world speed.");
         EspKey = Config.Bind("Hotkeys", "ESP", KeyCode.F3, "Toggle junk and card ESP.");
         AutoCleanupKey = Config.Bind("Hotkeys", "AutoCleanup", KeyCode.F4, "Collect all cards, then delete all remaining junk.");
+        BagAlwaysFullKey = Config.Bind("Hotkeys", "BagAlwaysFull", KeyCode.F5, "Toggle always-full bag.");
+        MaxCollectionKey = Config.Bind("Hotkeys", "MaxCollection", KeyCode.F6, "Complete the card collection at maximum quality.");
+        CollectAllTapesKey = Config.Bind("Hotkeys", "CollectAllTapes", KeyCode.F7, "Unlock every cassette in the tape player.");
 
         NoclipSpeed = Config.Bind("Values", "NoclipSpeed", 10f, "Noclip movement speed.");
         WorldSpeedValue = Config.Bind("Values", "WorldSpeed", 2f, "Time.timeScale while WorldSpeed is enabled.");
@@ -60,11 +69,14 @@ public sealed class Plugin : BasePlugin
 
         WorldSpeedEnabled = Config.Bind("Toggles", "WorldSpeed", false, "Persist WorldSpeed state.");
         EspEnabled = Config.Bind("Toggles", "ESP", false, "Persist ESP state.");
+        BagAlwaysFullEnabled = Config.Bind("Toggles", "BagAlwaysFull", false, "Keep the active junk bag full.");
 
         ClampConfiguration();
         _behaviour = AddComponent<CheatBehaviour>();
         Log.LogInfo($"Kotamon Dev Cheat {PluginVersion} loaded. {MenuKey.Value}=Menu, {NoclipKey.Value}=Noclip, " +
-            $"{WorldSpeedKey.Value}=WorldSpeed, {EspKey.Value}=ESP, {AutoCleanupKey.Value}=Auto Cleanup.");
+            $"{WorldSpeedKey.Value}=WorldSpeed, {EspKey.Value}=ESP, {AutoCleanupKey.Value}=Auto Cleanup, " +
+            $"{BagAlwaysFullKey.Value}=Full Bag, {MaxCollectionKey.Value}=Max Collection, " +
+            $"{CollectAllTapesKey.Value}=All Tapes.");
     }
 
     public override bool Unload()
@@ -108,6 +120,8 @@ public sealed class CheatBehaviour : MonoBehaviour
 
     private readonly List<JunkPickup> _espTargets = new();
     private readonly HashSet<int> _zoneCardInstanceIds = new();
+    private readonly HashSet<int> _zonePartInstanceIds = new();
+    private readonly HashSet<int> _zoneCollectibleInstanceIds = new();
 
     private PlayerNoClipController _nativeNoclip;
     private PlayerCharacterController _player;
@@ -133,19 +147,21 @@ public sealed class CheatBehaviour : MonoBehaviour
 
     private float _nextEspRefresh;
     private float _nextFragmentRefresh;
+    private float _nextBagFillRefresh;
     private float _nextAutomationErrorLog;
     private int _cleanupCardsRemaining;
     private int _cleanupTrashRemaining;
     private int _fragmentPartsCount;
     private int _fragmentPartsNeeded = 5;
     private int _lastCleanupFragmentsCollected;
+    private int _lastTapesUnlocked;
     private int _lastMoneyValue = -1;
     private float _fragmentSecondsRemaining = -1f;
     private string _cleanupPhase = "Idle";
 
     private Material _lineMaterial;
-    private Rect _menuRect = new(395f, 20f, 590f, 510f);
-    private Rect _statusRect = new(15f, 15f, 375f, 175f);
+    private Rect _menuRect = new(395f, 20f, 590f, 650f);
+    private Rect _statusRect = new(15f, 15f, 375f, 237f);
     private DragTarget _dragTarget;
     private Vector2 _dragOffset;
 
@@ -156,7 +172,10 @@ public sealed class CheatBehaviour : MonoBehaviour
         Noclip,
         WorldSpeed,
         Esp,
-        AutoCleanup
+        AutoCleanup,
+        BagAlwaysFull,
+        MaxCollection,
+        CollectAllTapes
     }
 
     private enum DragTarget
@@ -170,6 +189,8 @@ public sealed class CheatBehaviour : MonoBehaviour
     {
         None,
         DirtyCard,
+        CardFragment,
+        Figurine,
         CardBox
     }
 
@@ -193,13 +214,18 @@ public sealed class CheatBehaviour : MonoBehaviour
         if (_fallbackNoclip)
             UpdateFallbackNoclip();
 
+        if (Plugin.BagAlwaysFullEnabled.Value)
+            MaintainBagFull();
+
         if (Plugin.WorldSpeedEnabled.Value)
             Time.timeScale = Plugin.WorldSpeedValue.Value;
 
         if (Plugin.EspEnabled.Value && Time.realtimeSinceStartup >= _nextEspRefresh)
             RefreshEspTargets();
 
-        if (Time.realtimeSinceStartup >= _nextFragmentRefresh)
+        // Fragment HUD data is requested only while the menu is visible.  This
+        // keeps world loading independent from optional UI-only state reads.
+        if (_menuOpen && Time.realtimeSinceStartup >= _nextFragmentRefresh)
             RefreshFragmentState();
 
     }
@@ -273,6 +299,15 @@ public sealed class CheatBehaviour : MonoBehaviour
 
         if (Input.GetKeyDown(Plugin.AutoCleanupKey.Value))
             RunAutoCleanup();
+
+        if (Input.GetKeyDown(Plugin.BagAlwaysFullKey.Value))
+            SetBagAlwaysFullEnabled(!Plugin.BagAlwaysFullEnabled.Value);
+
+        if (Input.GetKeyDown(Plugin.MaxCollectionKey.Value))
+            CompleteMaxCollection();
+
+        if (Input.GetKeyDown(Plugin.CollectAllTapesKey.Value))
+            CollectAllTapes();
     }
 
     [HideFromIl2Cpp]
@@ -493,6 +528,128 @@ public sealed class CheatBehaviour : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
+    private void SetBagAlwaysFullEnabled(bool enabled)
+    {
+        Plugin.BagAlwaysFullEnabled.Value = enabled;
+        _nextBagFillRefresh = 0f;
+        Plugin.SaveConfig();
+        Plugin.ModLog.LogInfo($"Always Full Bag: {(enabled ? "ON" : "OFF")}");
+    }
+
+    [HideFromIl2Cpp]
+    private void MaintainBagFull()
+    {
+        if (Time.realtimeSinceStartup < _nextBagFillRefresh)
+            return;
+
+        _nextBagFillRefresh = Time.realtimeSinceStartup + 0.2f;
+        try
+        {
+            if (_pickupController == null)
+                _pickupController = Object.FindObjectOfType<PlayerPickupController>();
+            if (_pickupController == null)
+                return;
+
+            _pickupController.EnsureBagInHands();
+            var bag = _pickupController._activeBag;
+            if (bag != null && bag.HaveSpace)
+                bag.SetSaveCount(999999);
+        }
+        catch (Exception exception)
+        {
+            LogAutomationError("Always Full Bag", exception);
+        }
+    }
+
+    [HideFromIl2Cpp]
+    private void CompleteMaxCollection()
+    {
+        try
+        {
+            if (_collectionController == null)
+                _collectionController = Object.FindObjectOfType<PlayerCollectionController>();
+            if (_collectionController == null)
+                throw new InvalidOperationException("PlayerCollectionController was not found.");
+
+            _collectionController.EnsureAlbumContainsAllCards();
+            var cards = _collectionController.Cards;
+            var upgraded = 0;
+            if (cards != null)
+            {
+                for (var index = 0; index < cards.Count; index++)
+                {
+                    var card = cards[index];
+                    if (card == null)
+                        continue;
+
+                    card.Quality = EQualityType.Foil;
+                    card.Count = Math.Max(1, card.Count);
+                    upgraded++;
+                }
+            }
+
+            _collectionController.CheckAllSets();
+            _collectionController.Save();
+            Plugin.ModLog.LogInfo($"Max collection completed: {upgraded} cards upgraded to Foil.");
+        }
+        catch (Exception exception)
+        {
+            LogAutomationError("Max collection", exception);
+        }
+    }
+
+    [HideFromIl2Cpp]
+    private void CollectAllTapes()
+    {
+        try
+        {
+            var players = Object.FindObjectsByType<TapePlayer>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+            if (players == null || players.Length == 0)
+                throw new InvalidOperationException("TapePlayer was not found in the current scene.");
+
+            var tapeIds = new HashSet<int>();
+            var tapesUnlocked = 0;
+            for (var playerIndex = 0; playerIndex < players.Length; playerIndex++)
+            {
+                var player = players[playerIndex];
+                if (player == null || player._items == null)
+                    continue;
+
+                for (var itemIndex = 0; itemIndex < player._items.Count; itemIndex++)
+                {
+                    var item = player._items[itemIndex];
+                    var pickupData = item == null ? null : item.PickupData;
+                    if (pickupData == null || !tapeIds.Add(pickupData.GetInstanceID()))
+                        continue;
+
+                    TapePlayer.AddCollectedTape(pickupData, true);
+                    tapesUnlocked++;
+                }
+            }
+
+            if (tapesUnlocked == 0)
+                throw new InvalidOperationException("No configured cassette entries were initialized by TapePlayer.");
+
+            for (var index = 0; index < players.Length; index++)
+            {
+                var player = players[index];
+                if (player == null)
+                    continue;
+
+                player.RefreshItems();
+                player.Save();
+            }
+
+            _lastTapesUnlocked = tapesUnlocked;
+            Plugin.ModLog.LogInfo($"All cassette entries unlocked: {_lastTapesUnlocked}.");
+        }
+        catch (Exception exception)
+        {
+            LogAutomationError("Collect all tapes", exception);
+        }
+    }
+
+    [HideFromIl2Cpp]
     private void PrepareAutoCleanup()
     {
         _cleanupPhase = "Scanning";
@@ -558,29 +715,35 @@ public sealed class CheatBehaviour : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
-    private int CollectInstantFragment()
+    private int CollectInstantFragment(JunkPickup pickup)
     {
-        RefreshFragmentState();
-        if (_parametersController == null)
-            throw new InvalidOperationException("ParametersController was not found.");
-
-        if (_fragmentPartsCount >= _fragmentPartsNeeded)
+        if (pickup == null || !pickup.isActiveAndEnabled)
             return 0;
 
-        var newCount = Math.Min(_fragmentPartsNeeded, _fragmentPartsCount + 1);
-        _parametersController.SetParameter(ParameterType.DirtyPartsCount, newCount);
-        _parametersController.Save();
+        if (_pickupController == null)
+            throw new InvalidOperationException("PlayerPickupController was not found.");
 
-        // This is the same reset performed by the native fragment timer after it
-        // grants a part. It prevents the old timer from granting a duplicate.
-        if (_pickupController != null)
-            _pickupController.UpdatePartTimer();
-
-        _fragmentPartsCount = newCount;
-        _fragmentSecondsRemaining = _pickupController == null
-            ? -1f
-            : Mathf.Max(0f, (float)_pickupController._needPartTimer - (float)_pickupController._takingTimer);
+        CollectNativePickup(pickup, CardTargetKind.CardFragment);
         return 1;
+    }
+
+    [HideFromIl2Cpp]
+    private void CollectNativePickup(JunkPickup pickup, CardTargetKind kind)
+    {
+        if (pickup == null || !pickup.isActiveAndEnabled)
+            return;
+        if (_pickupController == null)
+            throw new InvalidOperationException("PlayerPickupController was not found.");
+
+        if (kind != CardTargetKind.DirtyCard && kind != CardTargetKind.CardFragment)
+            throw new InvalidOperationException($"Unsupported native pickup kind: {kind}.");
+
+        // Use the same entry point as a normal interact press.  It performs
+        // the game's own type dispatch, including the fragment pickup event
+        // that increments DirtyPartsCount.  Do not destroy a special pickup
+        // manually: a rejected native pickup must remain in the world.
+        if (!_pickupController.Pick(pickup, true))
+            throw new InvalidOperationException($"Native pickup was rejected for {kind}.");
     }
 
     [HideFromIl2Cpp]
@@ -600,7 +763,8 @@ public sealed class CheatBehaviour : MonoBehaviour
                     continue;
 
                 var kind = ClassifyCardTarget(target);
-                if (kind == CardTargetKind.DirtyCard)
+                if (kind == CardTargetKind.DirtyCard || kind == CardTargetKind.CardFragment ||
+                    kind == CardTargetKind.Figurine)
                     _espTargets.Add(target);
             }
 
@@ -658,7 +822,8 @@ public sealed class CheatBehaviour : MonoBehaviour
                     continue;
 
                 var kind = ClassifyCardTarget(target);
-                if (kind != CardTargetKind.DirtyCard)
+                if (kind != CardTargetKind.DirtyCard && kind != CardTargetKind.CardFragment &&
+                    kind != CardTargetKind.Figurine)
                     continue;
 
                 var color = GetEspColor(kind);
@@ -818,6 +983,10 @@ public sealed class CheatBehaviour : MonoBehaviour
     {
         if (kind == CardTargetKind.DirtyCard)
             return new Color(1f, 0.25f, 1f, 1f);
+        if (kind == CardTargetKind.CardFragment)
+            return new Color(0.1f, 0.95f, 1f, 1f);
+        if (kind == CardTargetKind.Figurine)
+            return new Color(0.3f, 1f, 0.25f, 1f);
         return Color.yellow;
     }
 
@@ -826,7 +995,155 @@ public sealed class CheatBehaviour : MonoBehaviour
     {
         if (kind == CardTargetKind.DirtyCard)
             return $"Dirty Card  {distance:0.0}m";
+        if (kind == CardTargetKind.CardFragment)
+            return $"Card Fragment  {distance:0.0}m";
+        if (kind == CardTargetKind.Figurine)
+            return $"Figurine  {distance:0.0}m";
         return $"Unknown  {distance:0.0}m";
+    }
+
+    [HideFromIl2Cpp]
+    private void BuildCleanupBuckets(
+        List<JunkPickup> dirtyCards,
+        List<JunkPickup> fragments,
+        List<JunkPickup> cardBoxes,
+        List<JunkPickup> trash)
+    {
+        var protectedIds = new HashSet<int>();
+        var dirtyCardIds = new HashSet<int>();
+        var fragmentIds = new HashSet<int>();
+        var cardBoxIds = new HashSet<int>();
+        var trashIds = new HashSet<int>();
+
+        // Fragments are the sole pickup category that does not expose a
+        // reliable public data marker in this game build.  The zone's part
+        // registry is populated by the native spawn path and is therefore the
+        // authoritative source for both ESP and automatic collection.
+        var zones = Object.FindObjectsByType<JunkZoneController>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+        for (var zoneIndex = 0; zoneIndex < zones.Length; zoneIndex++)
+        {
+            var zone = zones[zoneIndex];
+            if (zone == null)
+                continue;
+
+            try
+            {
+                var parts = zone._partPickups;
+                if (parts == null)
+                    continue;
+
+                for (var index = 0; index < parts.Count; index++)
+                    AddProtectedPickup(parts[index], fragments, fragmentIds, protectedIds);
+            }
+            catch (Exception exception)
+            {
+                Plugin.ModLog.LogWarning($"Could not read this zone's fragment registry: {exception.Message}");
+            }
+        }
+
+        var worldPickups = Object.FindObjectsByType<JunkPickup>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+        for (var index = 0; index < worldPickups.Length; index++)
+        {
+            var pickup = worldPickups[index];
+            switch (ClassifyCardTarget(pickup))
+            {
+                case CardTargetKind.DirtyCard:
+                    AddProtectedPickup(pickup, dirtyCards, dirtyCardIds, protectedIds);
+                    break;
+                case CardTargetKind.CardFragment:
+                    AddProtectedPickup(pickup, fragments, fragmentIds, protectedIds);
+                    break;
+                case CardTargetKind.CardBox:
+                    AddProtectedPickup(pickup, cardBoxes, cardBoxIds, protectedIds);
+                    break;
+                case CardTargetKind.Figurine:
+                    MarkPickupProtected(pickup, protectedIds);
+                    break;
+                default:
+                    if (IsConfirmedTrash(pickup))
+                        AddTrashPickup(pickup, trash, trashIds, protectedIds);
+                    break;
+            }
+        }
+
+        Plugin.ModLog.LogInfo($"Auto Cleanup buckets: cards={dirtyCards.Count}, fragments={fragments.Count}, " +
+            $"cardBoxes={cardBoxes.Count}, normalTrash={trash.Count}, worldPickups={worldPickups.Length}, zones={zones.Length}.");
+        LogPickupDiagnostics(worldPickups);
+    }
+
+    [HideFromIl2Cpp]
+    private static void AddProtectedPickup(
+        JunkPickup pickup,
+        List<JunkPickup> bucket,
+        HashSet<int> bucketIds,
+        HashSet<int> protectedIds)
+    {
+        if (!TryGetLivePickupId(pickup, out var instanceId))
+            return;
+
+        protectedIds.Add(instanceId);
+        if (bucketIds.Add(instanceId))
+            bucket.Add(pickup);
+    }
+
+    [HideFromIl2Cpp]
+    private static void MarkPickupProtected(JunkPickup pickup, HashSet<int> protectedIds)
+    {
+        if (TryGetLivePickupId(pickup, out var instanceId))
+            protectedIds.Add(instanceId);
+    }
+
+    [HideFromIl2Cpp]
+    private static void AddTrashPickup(
+        JunkPickup pickup,
+        List<JunkPickup> trash,
+        HashSet<int> trashIds,
+        HashSet<int> protectedIds)
+    {
+        if (!TryGetLivePickupId(pickup, out var instanceId) || protectedIds.Contains(instanceId))
+            return;
+
+        if (trashIds.Add(instanceId))
+            trash.Add(pickup);
+    }
+
+    [HideFromIl2Cpp]
+    private static bool IsConfirmedTrash(JunkPickup pickup)
+    {
+        try
+        {
+            if (pickup == null || pickup.Data == null || pickup.Data.JunkType != EJunkType.Common)
+                return false;
+
+            // In this build, disposable loose garbage is explicitly backed by
+            // the ui_empty pickup data. A mere Common enum is not enough:
+            // unlabelled card fragments also use it and must remain available
+            // for normal/manual pickup until they can be identified reliably.
+            return string.Equals(pickup.Data.Name, "ui_empty", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            // Unknown objects are never classified as deletion targets.
+            return false;
+        }
+    }
+
+    [HideFromIl2Cpp]
+    private static bool TryGetLivePickupId(JunkPickup pickup, out int instanceId)
+    {
+        instanceId = 0;
+        try
+        {
+            if (pickup == null || !pickup.isActiveAndEnabled)
+                return false;
+
+            instanceId = pickup.GetInstanceID();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     [HideFromIl2Cpp]
@@ -837,39 +1154,27 @@ public sealed class CheatBehaviour : MonoBehaviour
         try
         {
             RefreshZoneCardIds();
-            var pickups = Object.FindObjectsByType<JunkPickup>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
             var dirtyCards = new List<JunkPickup>();
+            var fragments = new List<JunkPickup>();
             var cardBoxes = new List<JunkPickup>();
             var trash = new List<JunkPickup>();
+            BuildCleanupBuckets(dirtyCards, fragments, cardBoxes, trash);
 
-            for (var index = 0; index < pickups.Length; index++)
-            {
-                var pickup = pickups[index];
-                if (pickup == null || !pickup.isActiveAndEnabled)
-                    continue;
-
-                switch (ClassifyCardTarget(pickup))
-                {
-                    case CardTargetKind.DirtyCard:
-                        dirtyCards.Add(pickup);
-                        break;
-                    case CardTargetKind.CardBox:
-                        cardBoxes.Add(pickup);
-                        break;
-                    default:
-                        trash.Add(pickup);
-                        break;
-                }
-            }
-
-            _cleanupCardsRemaining = dirtyCards.Count + cardBoxes.Count;
+            _cleanupCardsRemaining = dirtyCards.Count + cardBoxes.Count + fragments.Count;
             _cleanupTrashRemaining = trash.Count;
 
             _collectionController = Object.FindObjectOfType<PlayerCollectionController>();
-            if (_cleanupCardsRemaining > 0 && _collectionController == null)
+            _pickupController = Object.FindObjectOfType<PlayerPickupController>();
+            if (cardBoxes.Count > 0 && _collectionController == null)
             {
                 _cleanupPhase = "No collection controller";
                 Plugin.ModLog.LogWarning("Auto Cleanup aborted before trash removal: PlayerCollectionController was not found.");
+                return;
+            }
+            if (dirtyCards.Count + fragments.Count > 0 && _pickupController == null)
+            {
+                _cleanupPhase = "No pickup controller";
+                Plugin.ModLog.LogWarning("Auto Cleanup aborted before trash removal: PlayerPickupController was not found.");
                 return;
             }
 
@@ -885,8 +1190,7 @@ public sealed class CheatBehaviour : MonoBehaviour
 
                 try
                 {
-                    _collectionController.TakeRandomCard();
-                    RemoveWorldPickup(pickup);
+                    CollectNativePickup(pickup, CardTargetKind.DirtyCard);
                     cardsCollected++;
                 }
                 catch (Exception exception)
@@ -922,15 +1226,16 @@ public sealed class CheatBehaviour : MonoBehaviour
                 return;
             }
 
-            if (cardsCollected + boxesCollected > 0)
+            if (cardsCollected + boxesCollected > 0 && _collectionController != null)
                 _collectionController.Save();
 
-            _cleanupPhase = "Fragment";
-            if (dirtyCards.Count + cardBoxes.Count + trash.Count > 0)
+            _cleanupPhase = "Fragments";
+            var fragmentsCollected = 0;
+            for (var index = 0; index < fragments.Count; index++)
             {
                 try
                 {
-                    _lastCleanupFragmentsCollected = CollectInstantFragment();
+                    fragmentsCollected += CollectInstantFragment(fragments[index]);
                 }
                 catch (Exception exception)
                 {
@@ -939,6 +1244,7 @@ public sealed class CheatBehaviour : MonoBehaviour
                     return;
                 }
             }
+            _lastCleanupFragmentsCollected = fragmentsCollected;
 
             _cleanupPhase = "Trash";
             var trashRemoved = 0;
@@ -956,7 +1262,7 @@ public sealed class CheatBehaviour : MonoBehaviour
             _cleanupTrashRemaining = 0;
             _cleanupPhase = "Done";
             Plugin.ModLog.LogInfo($"Auto Cleanup completed in one pass: dirtyCards={cardsCollected}, cardBoxes={boxesCollected}, " +
-                $"fragmentParts={_lastCleanupFragmentsCollected}, trash={trashRemoved}.");
+                $"fragments={_lastCleanupFragmentsCollected}, trash={trashRemoved}.");
         }
         catch (Exception exception)
         {
@@ -995,6 +1301,8 @@ public sealed class CheatBehaviour : MonoBehaviour
     private void RefreshZoneCardIds()
     {
         _zoneCardInstanceIds.Clear();
+        _zonePartInstanceIds.Clear();
+        _zoneCollectibleInstanceIds.Clear();
 
         try
         {
@@ -1007,26 +1315,26 @@ public sealed class CheatBehaviour : MonoBehaviour
 
                 try
                 {
-                    var cards = zone._cardPickups;
-                    if (cards == null)
+                    var parts = zone._partPickups;
+                    if (parts == null)
                         continue;
 
-                    for (var cardIndex = 0; cardIndex < cards.Count; cardIndex++)
+                    for (var partIndex = 0; partIndex < parts.Count; partIndex++)
                     {
-                        var card = cards[cardIndex];
-                        if (card != null)
-                            _zoneCardInstanceIds.Add(card.GetInstanceID());
+                        var part = parts[partIndex];
+                        if (part != null)
+                            _zonePartInstanceIds.Add(part.GetInstanceID());
                     }
                 }
-                catch
+                catch (Exception exception)
                 {
-                    // Name/data classification remains available as a fallback.
+                    Plugin.ModLog.LogWarning($"Could not refresh this zone's fragment registry: {exception.Message}");
                 }
             }
         }
         catch (Exception exception)
         {
-            LogAutomationError("Card registry scan", exception);
+            LogAutomationError("Fragment registry scan", exception);
         }
     }
 
@@ -1037,14 +1345,20 @@ public sealed class CheatBehaviour : MonoBehaviour
             return CardTargetKind.None;
 
         var trackedAsCard = false;
+        var trackedAsFragment = false;
+        var trackedAsFigurine = false;
         var isCardBox = false;
         var isDirtyCard = false;
+        var isFragment = false;
+        var isFigurine = false;
         var junkType = EJunkType.Common;
         var hasJunkType = false;
 
         try
         {
             trackedAsCard = _zoneCardInstanceIds.Contains(pickup.GetInstanceID());
+            trackedAsFragment = _zonePartInstanceIds.Contains(pickup.GetInstanceID());
+            trackedAsFigurine = _zoneCollectibleInstanceIds.Contains(pickup.GetInstanceID());
         }
         catch
         {
@@ -1058,9 +1372,12 @@ public sealed class CheatBehaviour : MonoBehaviour
             {
                 junkType = data.JunkType;
                 hasJunkType = true;
-                ReadCardMarkers(data.Name, ref isCardBox, ref isDirtyCard);
-                ReadCardMarkers(data.name, ref isCardBox, ref isDirtyCard);
-                ReadCardMarkers(data.Description, ref isCardBox, ref isDirtyCard);
+                ReadCardMarkers(data.Name, ref isCardBox, ref isDirtyCard, ref isFragment);
+                ReadCardMarkers(data.name, ref isCardBox, ref isDirtyCard, ref isFragment);
+                ReadCardMarkers(data.Description, ref isCardBox, ref isDirtyCard, ref isFragment);
+                ReadFigurineMarkers(data.Name, ref isFigurine);
+                ReadFigurineMarkers(data.name, ref isFigurine);
+                ReadFigurineMarkers(data.Description, ref isFigurine);
             }
         }
         catch
@@ -1070,8 +1387,10 @@ public sealed class CheatBehaviour : MonoBehaviour
 
         try
         {
-            ReadCardMarkers(pickup.name, ref isCardBox, ref isDirtyCard);
-            ReadCardMarkers(pickup.gameObject.name, ref isCardBox, ref isDirtyCard);
+            ReadCardMarkers(pickup.name, ref isCardBox, ref isDirtyCard, ref isFragment);
+            ReadCardMarkers(pickup.gameObject.name, ref isCardBox, ref isDirtyCard, ref isFragment);
+            ReadFigurineMarkers(pickup.name, ref isFigurine);
+            ReadFigurineMarkers(pickup.gameObject.name, ref isFigurine);
         }
         catch
         {
@@ -1081,16 +1400,20 @@ public sealed class CheatBehaviour : MonoBehaviour
         if ((hasJunkType && junkType == EJunkType.CardBox) || isCardBox)
             return CardTargetKind.CardBox;
 
-        // Card fragments are a virtual DirtyPartsCount parameter and never have a
-        // JunkPickup. Every active Card pickup in this build is a dirty card.
+        if (trackedAsFragment || isFragment || (hasJunkType && junkType == EJunkType.Part))
+            return CardTargetKind.CardFragment;
+
         if (trackedAsCard || isDirtyCard || (hasJunkType && junkType == EJunkType.Card))
             return CardTargetKind.DirtyCard;
+
+        if (trackedAsFigurine || isFigurine || (hasJunkType && junkType == EJunkType.Collectible))
+            return CardTargetKind.Figurine;
 
         return CardTargetKind.None;
     }
 
     [HideFromIl2Cpp]
-    private static void ReadCardMarkers(string value, ref bool isCardBox, ref bool isDirtyCard)
+    private static void ReadCardMarkers(string value, ref bool isCardBox, ref bool isDirtyCard, ref bool isFragment)
     {
         if (string.IsNullOrWhiteSpace(value))
             return;
@@ -1106,6 +1429,16 @@ public sealed class CheatBehaviour : MonoBehaviour
             return;
         }
 
+        if (normalized.Contains("fragment") ||
+            normalized.Contains("dirtypart") || normalized.Contains("partdirty") ||
+            normalized.Contains("cardpart") || normalized.Contains("partcard") ||
+            normalized.Contains("dirtypiece") || normalized.Contains("piecedirty") ||
+            normalized.Contains("cardpiece") || normalized.Contains("piececard"))
+        {
+            isFragment = true;
+            return;
+        }
+
         if (normalized.Contains("carddirty") ||
             normalized.Contains("carddirt") ||
             normalized.Contains("dirtycard") ||
@@ -1114,10 +1447,27 @@ public sealed class CheatBehaviour : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
+    private static void ReadFigurineMarkers(string value, ref bool isFigurine)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return;
+
+        var normalized = value.ToLowerInvariant()
+            .Replace(" ", string.Empty)
+            .Replace("_", string.Empty)
+            .Replace("-", string.Empty);
+
+        if (normalized.Contains("figurine") || normalized.Contains("figure") ||
+            normalized.Contains("statue"))
+            isFigurine = true;
+    }
+
+    [HideFromIl2Cpp]
     private void LogPickupDiagnostics(Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<JunkPickup> pickups)
     {
         var limit = Math.Min(pickups.Length, 48);
-        Plugin.ModLog.LogInfo($"Auto Cleanup scan: pickups={pickups.Length}, zoneCardIds={_zoneCardInstanceIds.Count}.");
+        Plugin.ModLog.LogInfo($"Auto Cleanup scan: worldPickups={pickups.Length}. " +
+            "Classification uses PickupData.JunkType and explicit object markers.");
 
         for (var index = 0; index < limit; index++)
         {
@@ -1139,11 +1489,16 @@ public sealed class CheatBehaviour : MonoBehaviour
         var objectName = "?";
         var dataName = "?";
         var junkType = "?";
+        var hasCardData = "?";
+        var hasCollectibleData = "?";
 
         try { objectName = pickup.name; } catch { }
         try { dataName = pickup.Data == null ? "<null>" : pickup.Data.Name; } catch { }
         try { junkType = pickup.Data == null ? "<null>" : pickup.Data.JunkType.ToString(); } catch { }
-        return $"object='{objectName}', data='{dataName}', junkType={junkType}";
+        try { hasCardData = pickup.Data != null && pickup.Data.CardData != null ? "yes" : "no"; } catch { }
+        try { hasCollectibleData = pickup.Data != null && pickup.Data.CollectibleData != null ? "yes" : "no"; } catch { }
+        return $"object='{objectName}', data='{dataName}', junkType={junkType}, " +
+            $"cardData={hasCardData}, collectibleData={hasCollectibleData}";
     }
 
     [HideFromIl2Cpp]
@@ -1196,6 +1551,9 @@ public sealed class CheatBehaviour : MonoBehaviour
             case BindingAction.WorldSpeed: Plugin.WorldSpeedKey.Value = key; break;
             case BindingAction.Esp: Plugin.EspKey.Value = key; break;
             case BindingAction.AutoCleanup: Plugin.AutoCleanupKey.Value = key; break;
+            case BindingAction.BagAlwaysFull: Plugin.BagAlwaysFullKey.Value = key; break;
+            case BindingAction.MaxCollection: Plugin.MaxCollectionKey.Value = key; break;
+            case BindingAction.CollectAllTapes: Plugin.CollectAllTapesKey.Value = key; break;
         }
     }
 
@@ -1249,28 +1607,42 @@ public sealed class CheatBehaviour : MonoBehaviour
         if (GUI.Button(new Rect(x + 320f, y + 289f, 245f, 28f), BindingText(BindingAction.AutoCleanup, Plugin.AutoCleanupKey.Value)))
             _bindingAction = BindingAction.AutoCleanup;
 
-        GUI.Label(new Rect(x + 20f, y + 336f, 140f, 25f), $"Money: {Plugin.MoneyTarget.Value}");
-        if (GUI.Button(new Rect(x + 160f, y + 330f, 68f, 28f), "-10000"))
+        DrawFeatureRow(x, y + 332f, "Always Full Bag", Plugin.BagAlwaysFullEnabled.Value, Plugin.BagAlwaysFullKey.Value,
+            BindingAction.BagAlwaysFull, () => SetBagAlwaysFullEnabled(!Plugin.BagAlwaysFullEnabled.Value));
+
+        if (GUI.Button(new Rect(x + 20f, y + 375f, 285f, 28f), "Max Card Collection: RUN NOW"))
+            CompleteMaxCollection();
+        if (GUI.Button(new Rect(x + 320f, y + 375f, 245f, 28f), BindingText(BindingAction.MaxCollection, Plugin.MaxCollectionKey.Value)))
+            _bindingAction = BindingAction.MaxCollection;
+
+        if (GUI.Button(new Rect(x + 20f, y + 418f, 285f, 28f), "All Cassettes: UNLOCK NOW"))
+            CollectAllTapes();
+        if (GUI.Button(new Rect(x + 320f, y + 418f, 245f, 28f), BindingText(BindingAction.CollectAllTapes, Plugin.CollectAllTapesKey.Value)))
+            _bindingAction = BindingAction.CollectAllTapes;
+
+        GUI.Label(new Rect(x + 20f, y + 465f, 140f, 25f), $"Money: {Plugin.MoneyTarget.Value}");
+        if (GUI.Button(new Rect(x + 160f, y + 459f, 68f, 28f), "-10000"))
             Plugin.MoneyTarget.Value = Math.Max(0, Plugin.MoneyTarget.Value - 10000);
-        if (GUI.Button(new Rect(x + 232f, y + 330f, 68f, 28f), "-1000"))
+        if (GUI.Button(new Rect(x + 232f, y + 459f, 68f, 28f), "-1000"))
             Plugin.MoneyTarget.Value = Math.Max(0, Plugin.MoneyTarget.Value - 1000);
-        if (GUI.Button(new Rect(x + 304f, y + 330f, 68f, 28f), "+1000"))
+        if (GUI.Button(new Rect(x + 304f, y + 459f, 68f, 28f), "+1000"))
             Plugin.MoneyTarget.Value = Math.Min(999999999, Plugin.MoneyTarget.Value + 1000);
-        if (GUI.Button(new Rect(x + 376f, y + 330f, 76f, 28f), "+10000"))
+        if (GUI.Button(new Rect(x + 376f, y + 459f, 76f, 28f), "+10000"))
             Plugin.MoneyTarget.Value = Math.Min(999999999, Plugin.MoneyTarget.Value + 10000);
-        if (GUI.Button(new Rect(x + 456f, y + 330f, 109f, 28f), "APPLY MONEY"))
+        if (GUI.Button(new Rect(x + 456f, y + 459f, 109f, 28f), "APPLY MONEY"))
             ApplyMoneyTarget();
 
-        GUI.Label(new Rect(x + 20f, y + 378f, 170f, 25f), "Menu hotkey");
-        if (GUI.Button(new Rect(x + 195f, y + 375f, 180f, 28f), BindingText(BindingAction.Menu, Plugin.MenuKey.Value)))
+        GUI.Label(new Rect(x + 20f, y + 507f, 170f, 25f), "Menu hotkey");
+        if (GUI.Button(new Rect(x + 195f, y + 504f, 180f, 28f), BindingText(BindingAction.Menu, Plugin.MenuKey.Value)))
             _bindingAction = BindingAction.Menu;
 
-        if (GUI.Button(new Rect(x + 390f, y + 375f, 165f, 28f), "Reset TimeScale"))
+        if (GUI.Button(new Rect(x + 390f, y + 504f, 165f, 28f), "Reset TimeScale"))
             SetWorldSpeedEnabled(false);
 
-        GUI.Label(new Rect(x + 20f, y + 425f, width - 40f, 65f),
-            "Auto Cleanup completes in one frame: cards -> +1 timed fragment -> trash.\n" +
-            "Fragments are virtual: ESP shows their counter/timer; boxes mark dirty cards only.");
+        GUI.Label(new Rect(x + 20f, y + 554f, width - 40f, 72f),
+            "Auto Cleanup: cards -> fragments -> trash. If a fragment cannot be verified, trash is kept.\n" +
+            "Max Collection unlocks every card at Foil quality. All Cassettes unlocks every tape.\n" +
+            "ESP: cards magenta, fragments cyan, figurines green.");
     }
 
     [HideFromIl2Cpp]
@@ -1362,5 +1734,8 @@ public sealed class CheatBehaviour : MonoBehaviour
         GUI.Label(new Rect(x + 13f, y + 115f, 345f, 20f),
             $"Cards: {_cleanupCardsRemaining}  Parts: {_fragmentPartsCount}/{_fragmentPartsNeeded} (+{_lastCleanupFragmentsCollected})  Trash: {_cleanupTrashRemaining}");
         GUI.Label(new Rect(x + 13f, y + 137f, 345f, 20f), $"Money: {(_lastMoneyValue >= 0 ? _lastMoneyValue.ToString() : "use menu to set")}");
+        GUI.Label(new Rect(x + 13f, y + 159f, 345f, 20f), $"{Plugin.BagAlwaysFullKey.Value} Full Bag: {(Plugin.BagAlwaysFullEnabled.Value ? "ON" : "OFF")}");
+        GUI.Label(new Rect(x + 13f, y + 181f, 345f, 20f), $"{Plugin.MaxCollectionKey.Value} Max Collection: press to complete");
+        GUI.Label(new Rect(x + 13f, y + 203f, 345f, 20f), $"{Plugin.CollectAllTapesKey.Value} All Cassettes: {_lastTapesUnlocked}");
     }
 }
