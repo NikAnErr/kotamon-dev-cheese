@@ -112,10 +112,6 @@ The launcher is written to `release/KotamonDevCheat.exe`. Build outputs are inte
 | `SECURITY_NOTES.md` | Defensive findings and mitigations |
 | `THIRD_PARTY_NOTICES.txt` | BepInEx attribution and modification notice |
 
-## Defensive perspective
-
-The companion [security notes](SECURITY_NOTES.md) discuss what the experiment exposes and how to reduce the attack surface: exclude development controllers from production, validate movement and economy server-side, minimize replication of hidden objects, and treat client integrity checks as only one layer of defense.
-
 ## Third-party software
 
 The launcher bundles a modified BepInEx 6 IL2CPP runtime. BepInEx is distributed under LGPL-2.1; attribution, source links, and the compatibility transformation scripts are included in this repository and in the installed payload. See [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
